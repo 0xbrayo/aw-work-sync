@@ -1,0 +1,87 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    name: Build Binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: aw-work-sync-linux
+          - os: macos-latest
+            artifact_name: aw-work-sync-macos
+          - os: windows-latest
+            artifact_name: aw-work-sync-windows.exe
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build project
+      run: cargo build --release
+
+    - name: Rename binary
+      shell: bash
+      run: |
+        cd target/release
+        if [ "${{ matrix.os }}" == "windows-latest" ]; then
+          mv aw-work-sync.exe ${{ matrix.artifact_name }}
+        else
+          mv aw-work-sync ${{ matrix.artifact_name }}
+        fi
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: target/release/${{ matrix.artifact_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Rename and zip artifacts
+      run: |
+        cd artifacts
+        for file in */*; do
+          if [[ $file == *"windows"* ]]; then
+            mv "$file" aw-work-sync.exe
+            zip "aw-work-sync-windows.zip" aw-work-sync.exe
+            rm aw-work-sync.exe
+          else
+            mv "$file" aw-work-sync
+            zip "${file%/*}.zip" aw-work-sync
+            rm aw-work-sync
+          fi
+        done
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
+        draft: true
+        prerelease: false
+        files: |
+          artifacts/*.zip

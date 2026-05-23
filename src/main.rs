@@ -1,13 +1,16 @@
- mod sheets;
+ mod cache;
+mod sheets;
 mod working_hours;
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use aw_client_rust::{
     classes::CategorySpec,
     queries::{DesktopQueryParams, QueryParams, QueryParamsBase},
     AwClient,
 };
 use aw_models::Event;
+use cache::{cache_key, QueryCache};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -17,6 +20,10 @@ use std::time::Duration as StdDuration;
 const BREAK_TIME_SECS: i64 = 10 * 60;
 const DAYS_BACK_ON_NEW: i64 = 30;
 const DAY_START_HOUR: u32 = 4;
+const CACHE_TTL_TODAY_HOURS_SECS: i64 = 24 * 3600;
+const CACHE_TTL_PAST_DAYS_SECS: i64 = 3 * 24 * 3600;
+// aw-client flushes events every 10s (commit_interval); 30s gives 3× margin for late-landing events.
+const CACHE_GRACE_SECS: i64 = 30;
 
 #[derive(Serialize, Deserialize)]
 struct FileConfig {
@@ -30,13 +37,21 @@ struct Config {
     interval: StdDuration,
 }
 
-fn config_path() -> PathBuf {
+fn config_dir() -> PathBuf {
     let dir = dirs::config_dir()
         .expect("cannot find config dir")
         .join("activitywatch")
         .join("aw-work-sync");
     std::fs::create_dir_all(&dir).expect("cannot create config dir");
-    dir.join("config.yaml")
+    dir
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("config.yaml")
+}
+
+fn cache_path(host: &str) -> PathBuf {
+    config_dir().join(format!("query_cache_{}.json", host))
 }
 
 fn backup_path(base: &std::path::Path, n: u8) -> PathBuf {
@@ -179,6 +194,28 @@ fn hostname() -> String {
         .replace(".local", "")
 }
 
+/// Split today into completed 1-hour aligned blocks (cacheable) and a live trailing window.
+///
+/// A block is cacheable only once its end time is at least CACHE_GRACE_SECS in the past,
+/// giving late-landing aw-client events (flushed every 10s) time to arrive.
+/// Live window: (end of last cached block, now) — covers the full current partial hour.
+/// Never overlaps with cached blocks.
+fn today_time_blocks(
+    now: DateTime<Local>,
+    day_start: DateTime<Local>,
+) -> (Vec<(DateTime<Local>, DateTime<Local>)>, (DateTime<Local>, DateTime<Local>)) {
+    let grace = Duration::seconds(CACHE_GRACE_SECS);
+
+    let cached_blocks: Vec<_> = std::iter::successors(Some(day_start), |&h| Some(h + Duration::hours(1)))
+        .take_while(|&h| h + Duration::hours(1) + grace <= now)
+        .map(|h| (h, h + Duration::hours(1)))
+        .collect();
+
+    // The live window starts at the end of the last cached block (or day_start if none are cached yet).
+    let live_start = cached_blocks.last().map(|&(_, end)| end).unwrap_or(day_start);
+    (cached_blocks, (live_start, now))
+}
+
 fn build_query(hostname: &str, regex: &str) -> String {
     let params = DesktopQueryParams {
         base: QueryParamsBase {
@@ -210,6 +247,8 @@ fn build_query(hostname: &str, regex: &str) -> String {
 }
 
 async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &str) -> Result<()> {
+    let mut cache = QueryCache::load(cache_path(host))?;
+
     let now = Local::now();
     let today_naive = NaiveDateTime::new(
         now.date_naive(),
@@ -223,12 +262,17 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
     let sheets = sheets::SheetsClient::from_service_account().await?;
     let worksheet = format!("worked-{}", host);
 
-    let values = sheets
+    let raw_values = sheets
         .get_all_values(sheet_key, &worksheet)
         .await
         .with_context(|| {
             format!("Worksheet '{}' not found — create it in your spreadsheet first.", worksheet)
         })?;
+
+    let values: Vec<Vec<String>> = raw_values
+        .into_iter()
+        .filter(|row| !row.is_empty() && !row[0].trim().is_empty())
+        .collect();
 
     let last_date: Option<NaiveDate> = values
         .last()
@@ -250,29 +294,86 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         None => DAYS_BACK_ON_NEW as usize,
     };
 
-    let mut timeperiods: Vec<(DateTime<Local>, DateTime<Local>)> = (0..days_back)
+    // Day-granular timeperiods (one per day from oldest to today).
+    let timeperiods: Vec<(DateTime<Local>, DateTime<Local>)> = (0..days_back)
+        .rev()
         .map(|i| {
             let i = i as i64;
             (today - Duration::days(i), today + Duration::days(1 - i))
         })
         .collect();
-    timeperiods.reverse();
 
-    let timeperiods_utc: Vec<(DateTime<Utc>, DateTime<Utc>)> = timeperiods
-        .iter()
-        .map(|(s, e)| (s.with_timezone(&Utc), e.with_timezone(&Utc)))
-        .collect();
+    // Build a batched query covering cache misses + grace-period days + the live window.
+    //
+    // batch_query: timeperiods to send to AW.
+    // batch_cache: per-slot caching intent — Some((key, ttl)) to store, None to skip caching.
+    //   None is used for: (a) the live window, and (b) past days still within CACHE_GRACE_SECS
+    //   of their end time (query fresh every sync until settled, then lock into 3-day TTL).
+    let mut batch_query: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    let mut batch_cache: Vec<Option<(String, i64)>> = Vec::new();
+
+    let now_utc = now.with_timezone(&Utc);
+
+    // Past days (all except the last entry which is today).
+    for tp in &timeperiods[..timeperiods.len().saturating_sub(1)] {
+        if tp.0 > now {
+            continue;
+        }
+        let (s, e) = (tp.0.with_timezone(&Utc), tp.1.with_timezone(&Utc));
+        let key = cache_key(&s, &e);
+
+        if e + Duration::seconds(CACHE_GRACE_SECS) > now_utc {
+            // Day ended within the grace window: always query fresh so late-landing events
+            // (still in aw-client's commit buffer) are captured before the 3-day cache locks in.
+            batch_query.push((s, e));
+            batch_cache.push(None);
+        } else if cache.get(&key).is_none() {
+            // Settled and not yet cached: query and store with 3-day TTL.
+            batch_query.push((s, e));
+            batch_cache.push(Some((key, CACHE_TTL_PAST_DAYS_SECS)));
+        }
+        // else: settled cache hit — skip.
+    }
+
+    // Today: completed 1-hour blocks (cacheable) + live window (always queried).
+    let (today_blocks, live_window) = today_time_blocks(now, today);
+    for (bs, be) in &today_blocks {
+        let (s, e) = (bs.with_timezone(&Utc), be.with_timezone(&Utc));
+        let key = cache_key(&s, &e);
+        if cache.get(&key).is_none() {
+            batch_query.push((s, e));
+            batch_cache.push(Some((key, CACHE_TTL_TODAY_HOURS_SECS)));
+        }
+    }
+    batch_query.push((live_window.0.with_timezone(&Utc), live_window.1.with_timezone(&Utc)));
+    batch_cache.push(None); // live window: never cached
 
     let query_str = build_query(host, regex);
-    println!("Querying ActivityWatch ({} day(s))...", days_back);
-    let results = aw_client
-        .query(&query_str, timeperiods_utc)
+    println!("Querying ActivityWatch ({} window(s))...", batch_query.len());
+    let mut fresh_results = aw_client
+        .query(&query_str, batch_query.clone())
         .await
         .context("Failed to query ActivityWatch (is it running on port 5600?)")?;
 
+    let live_result = fresh_results.pop().unwrap();
+
+    // Store results that have a cache intent. Collect the rest (grace-period past days)
+    // into fresh_map so reconstruction can use them without hitting an empty cache entry.
+    let mut fresh_map: HashMap<String, serde_json::Value> = HashMap::new();
+    for (i, result) in fresh_results.into_iter().enumerate() {
+        match &batch_cache[i] {
+            Some((key, ttl)) => cache.insert(key.clone(), result, *ttl),
+            None => {
+                let (s, e) = batch_query[i];
+                fresh_map.insert(cache_key(&s, &e), result);
+            }
+        }
+    }
+    cache.save()?;
+
     let initial_row_count = values.len();
 
-    for (tp, result) in timeperiods.iter().zip(results.iter()) {
+    for tp in &timeperiods {
         if tp.0 > now {
             continue;
         }
@@ -280,11 +381,38 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         let date = tp.0.date_naive();
         let date_str = date.format("%Y-%m-%d").to_string();
 
-        let events: Vec<Event> =
-            serde_json::from_value(result["events"].clone()).unwrap_or_default();
-        let hours = working_hours::generous_approx(&events, Duration::seconds(BREAK_TIME_SECS))
-            .num_seconds() as f64
-            / 3600.0;
+        let is_today = date == today.date_naive();
+
+        let hours = if is_today {
+            // Merge events from all cached hour blocks + live window result.
+            let mut all_events: Vec<Event> = Vec::new();
+            for (bs, be) in &today_blocks {
+                let key = cache_key(&bs.with_timezone(&Utc), &be.with_timezone(&Utc));
+                if let Some(entry) = cache.get(&key) {
+                    let evs: Vec<Event> =
+                        Deserialize::deserialize(&entry.result["events"]).unwrap_or_default();
+                    all_events.extend(evs);
+                }
+            }
+            let live_evs: Vec<Event> =
+                Deserialize::deserialize(&live_result["events"]).unwrap_or_default();
+            all_events.extend(live_evs);
+            working_hours::generous_approx(&all_events, Duration::seconds(BREAK_TIME_SECS))
+                .num_seconds() as f64
+                / 3600.0
+        } else {
+            let (s, e) = (tp.0.with_timezone(&Utc), tp.1.with_timezone(&Utc));
+            let key = cache_key(&s, &e);
+            // Grace-period days are in fresh_map (not yet cached); settled days are in cache.
+            let events: Vec<Event> = if let Some(result) = cache.get(&key).map(|e| &e.result).or_else(|| fresh_map.get(&key)) {
+                Deserialize::deserialize(&result["events"]).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            working_hours::generous_approx(&events, Duration::seconds(BREAK_TIME_SECS))
+                .num_seconds() as f64
+                / 3600.0
+        };
 
         match last_date {
             Some(ld) if date == ld => {
@@ -333,5 +461,5 @@ async fn main() -> Result<()> {
         tokio::time::sleep(config.interval).await;
     }
 
-    Ok(())
+    // Ok(())
 }

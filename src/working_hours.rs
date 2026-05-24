@@ -17,7 +17,11 @@ pub fn generous_approx(events: &[Event], max_break: Duration) -> Duration {
         (sorted[0].duration, sorted[0].timestamp + sorted[0].duration),
         |(total, prev_end), e| {
             let gap = e.timestamp - prev_end;
-            let gap_fill = if gap > Duration::zero() && gap < max_break { gap } else { Duration::zero() };
+            let gap_fill = if gap > Duration::zero() && gap < max_break {
+                gap
+            } else {
+                Duration::zero()
+            };
             (total + gap_fill + e.duration, e.timestamp + e.duration)
         },
     );

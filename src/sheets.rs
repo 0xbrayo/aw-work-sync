@@ -56,8 +56,8 @@ impl SheetsClient {
             )
         })?;
 
-        let sa: ServiceAccount = serde_json::from_str(&sa_json)
-            .context("Failed to parse service account JSON")?;
+        let sa: ServiceAccount =
+            serde_json::from_str(&sa_json).context("Failed to parse service account JSON")?;
 
         let now = Utc::now().timestamp();
         let claims = JwtClaims {
@@ -86,7 +86,11 @@ impl SheetsClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to obtain Google access token ({}): {}", status, text);
+            anyhow::bail!(
+                "Failed to obtain Google access token ({}): {}",
+                status,
+                text
+            );
         }
 
         let token: TokenResponse = resp

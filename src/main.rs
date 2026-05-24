@@ -26,16 +26,52 @@ const CACHE_TTL_TODAY_HOURS_SECS: i64 = 24 * 3600;
 const CACHE_TTL_PAST_DAYS_SECS: i64 = 3 * 24 * 3600;
 // aw-client flushes events every 10s (commit_interval); 30s gives 3× margin for late-landing events.
 const CACHE_GRACE_SECS: i64 = 30;
+const CONFIG_GUIDANCE: &str = "Please configure your sheets by editing the 'sheets' list in the config file.\nEach entry requires 'sheet_key' and 'regex' fields. Example:\n  sheets:\n    - sheet_key: \"your-sheet-key\"\n      regex: \"your-regex\"\nNote: if top-level 'sheet_key'/'regex' fields are also present, 'sheets[0]' takes precedence and they will be overwritten.";
 
-#[derive(Serialize, Deserialize)]
-struct FileConfig {
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct SheetConfig {
     sheet_key: String,
     regex: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sheet_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regex: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sheets: Vec<SheetConfig>,
+}
+
+impl FileConfig {
+    fn normalize(mut self) -> Self {
+        if self.sheets.is_empty() {
+            if let (Some(sk), Some(rx)) = (self.sheet_key.take(), self.regex.take()) {
+                self.sheets.push(SheetConfig {
+                    sheet_key: sk,
+                    regex: rx,
+                });
+            }
+        }
+        if !self.sheets.is_empty() {
+            let first_sheet = &self.sheets[0];
+            if let (Some(sheet_key), Some(regex)) = (self.sheet_key.as_ref(), self.regex.as_ref()) {
+                if sheet_key != &first_sheet.sheet_key || regex != &first_sheet.regex {
+                    warn!(
+                        "config contains conflicting legacy sheet_key/regex fields and sheets[0]; using sheets[0] during normalization"
+                    );
+                }
+            }
+            self.sheet_key = Some(first_sheet.sheet_key.clone());
+            self.regex = Some(first_sheet.regex.clone());
+        }
+        self
+    }
+}
+
 struct Config {
-    sheet_key: String,
-    regex: String,
+    sheets: Vec<SheetConfig>,
     interval: StdDuration,
     verbose: bool,
     testing: bool,
@@ -49,8 +85,23 @@ fn config_path() -> PathBuf {
     logging::get_config_path().expect("cannot find config path")
 }
 
-fn cache_path(host: &str) -> PathBuf {
-    config_dir().join(format!("query_cache_{}.json", host))
+fn cache_path(host: &str, sheet_key: &str) -> PathBuf {
+    let sanitized_key: String = sheet_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let encoded_key = sheet_key
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("");
+    let cache_key = if sanitized_key.is_empty() {
+        format!("hex_{}", encoded_key)
+    } else {
+        format!("{}_{}", sanitized_key, encoded_key)
+    };
+    config_dir().join(format!("query_cache_{}_{}.json", host, cache_key))
 }
 
 fn backup_path(base: &std::path::Path, n: u8) -> PathBuf {
@@ -75,13 +126,34 @@ fn rotate_backups(path: &std::path::Path) -> Result<()> {
 }
 
 fn is_placeholder(cfg: &FileConfig) -> bool {
-    cfg.sheet_key == "your-sheet-key" || cfg.regex == "your-work-regex"
+    if !cfg.sheets.is_empty() {
+        return cfg
+            .sheets
+            .iter()
+            .any(|s| s.sheet_key == "your-sheet-key" || s.regex == "your-work-regex");
+    }
+    // Only flag as placeholder when the default sentinel values are present;
+    // missing fields indicate an invalid config, not a placeholder.
+    matches!(&cfg.sheet_key, Some(sk) if sk == "your-sheet-key")
+        || matches!(&cfg.regex, Some(rx) if rx == "your-work-regex")
+}
+
+/// Returns a human-readable reason if the config is incomplete, or `None` if valid.
+fn config_validation_error(cfg: &FileConfig) -> Option<String> {
+    if cfg.sheets.is_empty() {
+        return Some("no sheets configured".into());
+    }
+    None
 }
 
 fn write_config(path: &std::path::Path, sheet_key: &str, regex: &str) -> Result<()> {
     let cfg = FileConfig {
-        sheet_key: sheet_key.to_string(),
-        regex: regex.to_string(),
+        sheet_key: Some(sheet_key.to_string()),
+        regex: Some(regex.to_string()),
+        sheets: vec![SheetConfig {
+            sheet_key: sheet_key.to_string(),
+            regex: regex.to_string(),
+        }],
     };
     std::fs::write(path, serde_yaml::to_string(&cfg)?).context("failed to write config")?;
     info!("Config written to {}", path.display());
@@ -94,15 +166,21 @@ fn load_file_config() -> Result<FileConfig> {
     if !path.exists() {
         write_config(&path, "your-sheet-key", "your-work-regex")?;
         warn!("Created default config at {}", path.display());
-        warn!("Please set sheet_key and regex, then re-run.");
+        warn!("{}. Then re-run.", CONFIG_GUIDANCE);
         std::process::exit(1);
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
     let cfg: FileConfig = serde_yaml::from_str(&contents).context("failed to parse config.yaml")?;
+    let cfg = cfg.normalize();
     if is_placeholder(&cfg) {
         error!("Config at {} still has placeholder values.", path.display());
-        error!("Please set sheet_key and regex, then re-run.");
+        error!("{}.", CONFIG_GUIDANCE);
+        std::process::exit(1);
+    }
+    if let Some(reason) = config_validation_error(&cfg) {
+        error!("Config at {} is invalid: {}.", path.display(), reason);
+        error!("{}.", CONFIG_GUIDANCE);
         std::process::exit(1);
     }
     Ok(cfg)
@@ -114,8 +192,19 @@ fn apply_cli_to_config(sheet_key: &str, regex: &str) -> Result<()> {
     if path.exists() {
         let contents = std::fs::read_to_string(&path)?;
         let existing: FileConfig = serde_yaml::from_str(&contents)?;
+        let existing = existing.normalize();
         if !is_placeholder(&existing) {
-            if existing.sheet_key == sheet_key && existing.regex == regex {
+            if existing.sheets.len() > 1 {
+                anyhow::bail!(
+                    "Config has multiple sheets; positional CLI args cannot overwrite a multi-sheet config. \
+                     Please edit the config file directly: {}",
+                    path.display()
+                );
+            }
+            if existing.sheets.len() == 1
+                && existing.sheets[0].sheet_key == sheet_key
+                && existing.sheets[0].regex == regex
+            {
                 return Ok(()); // identical — nothing to do
             }
             rotate_backups(&path)?;
@@ -187,14 +276,17 @@ fn parse_args() -> Result<Config> {
     logging::setup_logger("aw-work-sync", testing, verbose)
         .map_err(|e| anyhow::anyhow!("Failed to setup logging: {}", e))?;
 
-    let (sheet_key, regex) = match positional.len() {
+    let sheets = match positional.len() {
         0 => {
             let f = load_file_config()?;
-            (f.sheet_key, f.regex)
+            f.sheets
         }
         2 => {
             apply_cli_to_config(&positional[0], &positional[1])?;
-            (positional[0].clone(), positional[1].clone())
+            vec![SheetConfig {
+                sheet_key: positional[0].clone(),
+                regex: positional[1].clone(),
+            }]
         }
         _ => {
             eprintln!("Provide both sheet_key and regex, or neither.");
@@ -204,8 +296,7 @@ fn parse_args() -> Result<Config> {
     };
 
     Ok(Config {
-        sheet_key,
-        regex,
+        sheets,
         interval,
         verbose,
         testing,
@@ -280,9 +371,9 @@ fn build_query(hostname: &str, regex: &str) -> String {
         "{canonical};\nduration = sum_durations(events);\nRETURN = {{\"events\": events, \"duration\": duration}};"
     )
 }
-
-async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &str) -> Result<()> {
-    let mut cache = QueryCache::load(cache_path(host))?;
+async fn sync_sheet(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &str) -> Result<()> {
+    let cache_file = cache_path(host, sheet_key);
+    let mut cache = QueryCache::load(cache_file)?;
 
     let now = Local::now();
     let today_naive = NaiveDateTime::new(
@@ -536,6 +627,32 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
     Ok(())
 }
 
+async fn sync_once(aw_client: &AwClient, config: &Config, host: &str) -> Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+    for (idx, sheet) in config.sheets.iter().enumerate() {
+        info!(
+            "--- Syncing sheet {}/{} [Key: {}, Regex: '{}'] ---",
+            idx + 1,
+            config.sheets.len(),
+            sheet.sheet_key,
+            sheet.regex
+        );
+        if let Err(e) = sync_sheet(aw_client, &sheet.sheet_key, &sheet.regex, host).await {
+            error!("Error syncing sheet '{}': {:#}", sheet.sheet_key, e);
+            errors.push(format!("Sheet '{}': {:#}", sheet.sheet_key, e));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to sync {} sheet(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = parse_args()?;
@@ -564,9 +681,100 @@ async fn main() -> Result<()> {
         config.interval.as_secs()
     );
     loop {
-        if let Err(e) = sync_once(&aw_client, &config.sheet_key, &config.regex, &host).await {
+        if let Err(e) = sync_once(&aw_client, &config, &host).await {
             error!("Sync error: {:#}", e);
         }
         tokio::time::sleep(config.interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_legacy_config() {
+        let yaml = r#"
+sheet_key: "my-legacy-key"
+regex: "my-legacy-regex"
+"#;
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.sheet_key, Some("my-legacy-key".to_string()));
+        assert_eq!(cfg.regex, Some("my-legacy-regex".to_string()));
+        assert!(cfg.sheets.is_empty());
+
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.sheets.len(), 1);
+        assert_eq!(cfg.sheets[0].sheet_key, "my-legacy-key");
+        assert_eq!(cfg.sheets[0].regex, "my-legacy-regex");
+        assert_eq!(cfg.sheet_key, Some("my-legacy-key".to_string()));
+        assert_eq!(cfg.regex, Some("my-legacy-regex".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_multi_config() {
+        let yaml = r#"
+sheets:
+  - sheet_key: "key-1"
+    regex: "regex-1"
+  - sheet_key: "key-2"
+    regex: "regex-2"
+"#;
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.sheet_key.is_none());
+        assert!(cfg.regex.is_none());
+        assert_eq!(cfg.sheets.len(), 2);
+
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.sheets.len(), 2);
+        assert_eq!(cfg.sheets[0].sheet_key, "key-1");
+        assert_eq!(cfg.sheets[0].regex, "regex-1");
+        assert_eq!(cfg.sheets[1].sheet_key, "key-2");
+        assert_eq!(cfg.sheets[1].regex, "regex-2");
+        // Check legacy fields are populated from first sheet for backward compatibility
+        assert_eq!(cfg.sheet_key, Some("key-1".to_string()));
+        assert_eq!(cfg.regex, Some("regex-1".to_string()));
+    }
+
+    #[test]
+    fn test_is_placeholder() {
+        let cfg_placeholder_legacy = FileConfig {
+            sheet_key: Some("your-sheet-key".to_string()),
+            regex: Some("your-work-regex".to_string()),
+            sheets: vec![],
+        };
+        assert!(is_placeholder(&cfg_placeholder_legacy));
+
+        let cfg_placeholder_multi = FileConfig {
+            sheet_key: None,
+            regex: None,
+            sheets: vec![
+                SheetConfig {
+                    sheet_key: "some-key".to_string(),
+                    regex: "some-regex".to_string(),
+                },
+                SheetConfig {
+                    sheet_key: "your-sheet-key".to_string(),
+                    regex: "some-regex".to_string(),
+                },
+            ],
+        };
+        assert!(is_placeholder(&cfg_placeholder_multi));
+
+        let cfg_valid = FileConfig {
+            sheet_key: None,
+            regex: None,
+            sheets: vec![
+                SheetConfig {
+                    sheet_key: "key-1".to_string(),
+                    regex: "regex-1".to_string(),
+                },
+                SheetConfig {
+                    sheet_key: "key-2".to_string(),
+                    regex: "regex-2".to_string(),
+                },
+            ],
+        };
+        assert!(!is_placeholder(&cfg_valid));
     }
 }

@@ -1,5 +1,5 @@
 use aw_models::Event;
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 
 /// Generous approximation of worked time: fills gaps shorter than max_break by extending
 /// the preceding event's duration, then sums all durations.
@@ -27,4 +27,15 @@ pub fn generous_approx(events: &[Event], max_break: Duration) -> Duration {
     );
 
     total
+}
+
+/// Returns (first_event_timestamp, last_event_end_timestamp) for boundary stitching.
+/// `last_event_end` = timestamp + duration of the chronologically last event.
+pub fn event_boundaries(events: &[Event]) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    if events.is_empty() {
+        return None;
+    }
+    let first = events.iter().min_by_key(|e| e.timestamp)?;
+    let last = events.iter().max_by_key(|e| e.timestamp + e.duration)?;
+    Some((first.timestamp, last.timestamp + last.duration))
 }

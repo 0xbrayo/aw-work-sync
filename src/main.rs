@@ -1,9 +1,9 @@
- mod cache;
+mod cache;
+mod logging;
 mod sheets;
 mod working_hours;
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use aw_client_rust::{
     classes::CategorySpec,
     queries::{DesktopQueryParams, QueryParams, QueryParamsBase},
@@ -12,7 +12,9 @@ use aw_client_rust::{
 use aw_models::Event;
 use cache::{cache_key, QueryCache};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration as StdDuration;
@@ -35,19 +37,16 @@ struct Config {
     sheet_key: String,
     regex: String,
     interval: StdDuration,
+    verbose: bool,
+    testing: bool,
 }
 
 fn config_dir() -> PathBuf {
-    let dir = dirs::config_dir()
-        .expect("cannot find config dir")
-        .join("activitywatch")
-        .join("aw-work-sync");
-    std::fs::create_dir_all(&dir).expect("cannot create config dir");
-    dir
+    logging::get_config_dir().expect("cannot find config dir")
 }
 
 fn config_path() -> PathBuf {
-    config_dir().join("config.yaml")
+    logging::get_config_path().expect("cannot find config path")
 }
 
 fn cache_path(host: &str) -> PathBuf {
@@ -80,9 +79,12 @@ fn is_placeholder(cfg: &FileConfig) -> bool {
 }
 
 fn write_config(path: &std::path::Path, sheet_key: &str, regex: &str) -> Result<()> {
-    let cfg = FileConfig { sheet_key: sheet_key.to_string(), regex: regex.to_string() };
+    let cfg = FileConfig {
+        sheet_key: sheet_key.to_string(),
+        regex: regex.to_string(),
+    };
     std::fs::write(path, serde_yaml::to_string(&cfg)?).context("failed to write config")?;
-    println!("Config written to {}", path.display());
+    info!("Config written to {}", path.display());
     Ok(())
 }
 
@@ -91,17 +93,16 @@ fn load_file_config() -> Result<FileConfig> {
     let path = config_path();
     if !path.exists() {
         write_config(&path, "your-sheet-key", "your-work-regex")?;
-        eprintln!("Created default config at {}", path.display());
-        eprintln!("Please set sheet_key and regex, then re-run.");
+        warn!("Created default config at {}", path.display());
+        warn!("Please set sheet_key and regex, then re-run.");
         std::process::exit(1);
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
-    let cfg: FileConfig =
-        serde_yaml::from_str(&contents).context("failed to parse config.yaml")?;
+    let cfg: FileConfig = serde_yaml::from_str(&contents).context("failed to parse config.yaml")?;
     if is_placeholder(&cfg) {
-        eprintln!("Config at {} still has placeholder values.", path.display());
-        eprintln!("Please set sheet_key and regex, then re-run.");
+        error!("Config at {} still has placeholder values.", path.display());
+        error!("Please set sheet_key and regex, then re-run.");
         std::process::exit(1);
     }
     Ok(cfg)
@@ -118,7 +119,10 @@ fn apply_cli_to_config(sheet_key: &str, regex: &str) -> Result<()> {
                 return Ok(()); // identical — nothing to do
             }
             rotate_backups(&path)?;
-            println!("Previous config backed up to {}", backup_path(&path, 1).display());
+            info!(
+                "Previous config backed up to {}",
+                backup_path(&path, 1).display()
+            );
         }
     }
     write_config(&path, sheet_key, regex)
@@ -144,15 +148,27 @@ fn parse_duration(s: &str) -> Result<StdDuration> {
 fn parse_args() -> Result<Config> {
     let args: Vec<String> = std::env::args().collect();
     let mut interval = parse_duration("5m")?;
+    let mut verbose = false;
+    let mut testing = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--interval" => {
-                let val = args.get(i + 1).with_context(|| "--interval requires a value")?;
+                let val = args
+                    .get(i + 1)
+                    .with_context(|| "--interval requires a value")?;
                 interval = parse_duration(val)?;
                 i += 2;
+            }
+            "--verbose" => {
+                verbose = true;
+                i += 1;
+            }
+            "--testing" => {
+                testing = true;
+                i += 1;
             }
             s if !s.starts_with("--") => {
                 positional.push(s.to_string());
@@ -160,11 +176,16 @@ fn parse_args() -> Result<Config> {
             }
             other => {
                 eprintln!("Unknown argument: {}", other);
-                eprintln!("Usage: aw-work-sync [sheet_key regex] [--interval <5m|2h|30s>]");
+                eprintln!("Usage: aw-work-sync [sheet_key regex] [--interval <5m|2h|30s>] [--verbose] [--testing]");
                 std::process::exit(1);
             }
         }
     }
+
+    // Setup logging using ActivityWatch conventions early, so load_file_config / apply_cli_to_config
+    // logging will actually be captured.
+    logging::setup_logger("aw-work-sync", testing, verbose)
+        .map_err(|e| anyhow::anyhow!("Failed to setup logging: {}", e))?;
 
     let (sheet_key, regex) = match positional.len() {
         0 => {
@@ -177,12 +198,18 @@ fn parse_args() -> Result<Config> {
         }
         _ => {
             eprintln!("Provide both sheet_key and regex, or neither.");
-            eprintln!("Usage: aw-work-sync [sheet_key regex] [--interval <5m|2h|30s>]");
+            eprintln!("Usage: aw-work-sync [sheet_key regex] [--interval <5m|2h|30s>] [--verbose] [--testing]");
             std::process::exit(1);
         }
     };
 
-    Ok(Config { sheet_key, regex, interval })
+    Ok(Config {
+        sheet_key,
+        regex,
+        interval,
+        verbose,
+        testing,
+    })
 }
 
 fn hostname() -> String {
@@ -200,19 +227,27 @@ fn hostname() -> String {
 /// giving late-landing aw-client events (flushed every 10s) time to arrive.
 /// Live window: (end of last cached block, now) — covers the full current partial hour.
 /// Never overlaps with cached blocks.
+#[allow(clippy::type_complexity)]
 fn today_time_blocks(
     now: DateTime<Local>,
     day_start: DateTime<Local>,
-) -> (Vec<(DateTime<Local>, DateTime<Local>)>, (DateTime<Local>, DateTime<Local>)) {
+) -> (
+    Vec<(DateTime<Local>, DateTime<Local>)>,
+    (DateTime<Local>, DateTime<Local>),
+) {
     let grace = Duration::seconds(CACHE_GRACE_SECS);
 
-    let cached_blocks: Vec<_> = std::iter::successors(Some(day_start), |&h| Some(h + Duration::hours(1)))
-        .take_while(|&h| h + Duration::hours(1) + grace <= now)
-        .map(|h| (h, h + Duration::hours(1)))
-        .collect();
+    let cached_blocks: Vec<_> =
+        std::iter::successors(Some(day_start), |&h| Some(h + Duration::hours(1)))
+            .take_while(|&h| h + Duration::hours(1) + grace <= now)
+            .map(|h| (h, h + Duration::hours(1)))
+            .collect();
 
     // The live window starts at the end of the last cached block (or day_start if none are cached yet).
-    let live_start = cached_blocks.last().map(|&(_, end)| end).unwrap_or(day_start);
+    let live_start = cached_blocks
+        .last()
+        .map(|&(_, end)| end)
+        .unwrap_or(day_start);
     (cached_blocks, (live_start, now))
 }
 
@@ -266,7 +301,10 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         .get_all_values(sheet_key, &worksheet)
         .await
         .with_context(|| {
-            format!("Worksheet '{}' not found — create it in your spreadsheet first.", worksheet)
+            format!(
+                "Worksheet '{}' not found — create it in your spreadsheet first.",
+                worksheet
+            )
         })?;
 
     let values: Vec<Vec<String>> = raw_values
@@ -280,13 +318,12 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
 
     let last_datetime = last_date.map(|d| {
-        let naive =
-            NaiveDateTime::new(d, NaiveTime::from_hms_opt(DAY_START_HOUR, 0, 0).unwrap());
+        let naive = NaiveDateTime::new(d, NaiveTime::from_hms_opt(DAY_START_HOUR, 0, 0).unwrap());
         Local.from_local_datetime(&naive).single().unwrap()
     });
 
     if let Some(ld) = last_date {
-        println!("Last entry: {}", ld);
+        info!("Last entry: {}", ld);
     }
 
     let days_back = match &last_datetime {
@@ -345,11 +382,17 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
             batch_cache.push(Some((key, CACHE_TTL_TODAY_HOURS_SECS)));
         }
     }
-    batch_query.push((live_window.0.with_timezone(&Utc), live_window.1.with_timezone(&Utc)));
+    batch_query.push((
+        live_window.0.with_timezone(&Utc),
+        live_window.1.with_timezone(&Utc),
+    ));
     batch_cache.push(None); // live window: never cached
 
     let query_str = build_query(host, regex);
-    println!("Querying ActivityWatch ({} window(s))...", batch_query.len());
+    info!(
+        "Querying ActivityWatch ({} window(s))...",
+        batch_query.len()
+    );
     let mut fresh_results = aw_client
         .query(&query_str, batch_query.clone())
         .await
@@ -404,7 +447,11 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
             let (s, e) = (tp.0.with_timezone(&Utc), tp.1.with_timezone(&Utc));
             let key = cache_key(&s, &e);
             // Grace-period days are in fresh_map (not yet cached); settled days are in cache.
-            let events: Vec<Event> = if let Some(result) = cache.get(&key).map(|e| &e.result).or_else(|| fresh_map.get(&key)) {
+            let events: Vec<Event> = if let Some(result) = cache
+                .get(&key)
+                .map(|e| &e.result)
+                .or_else(|| fresh_map.get(&key))
+            {
                 Deserialize::deserialize(&result["events"]).unwrap_or_default()
             } else {
                 Vec::new()
@@ -416,24 +463,30 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
 
         match last_date {
             Some(ld) if date == ld => {
-                println!("Updating  [{}, {:.4}h]", date_str, hours);
-                sheets.update_cell(sheet_key, &worksheet, initial_row_count, hours).await?;
+                info!("Updating  [{}, {:.4}h]", date_str, hours);
+                sheets
+                    .update_cell(sheet_key, &worksheet, initial_row_count, hours)
+                    .await?;
             }
             Some(ld) if date > ld => {
-                println!("Appending [{}, {:.4}h]", date_str, hours);
-                sheets.append_row(sheet_key, &worksheet, &date_str, hours).await?;
+                info!("Appending [{}, {:.4}h]", date_str, hours);
+                sheets
+                    .append_row(sheet_key, &worksheet, &date_str, hours)
+                    .await?;
             }
             None => {
-                println!("Appending [{}, {:.4}h]", date_str, hours);
-                sheets.append_row(sheet_key, &worksheet, &date_str, hours).await?;
+                info!("Appending [{}, {:.4}h]", date_str, hours);
+                sheets
+                    .append_row(sheet_key, &worksheet, &date_str, hours)
+                    .await?;
             }
             _ => {
-                println!("Skipping  [{}, {:.4}h]", date_str, hours);
+                debug!("Skipping  [{}, {:.4}h]", date_str, hours);
             }
         }
     }
 
-    println!("Done.");
+    info!("Done.");
     Ok(())
 }
 
@@ -441,25 +494,33 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
 async fn main() -> Result<()> {
     let config = parse_args()?;
 
+    if config.testing {
+        info!("Running in testing mode");
+    } else {
+        info!("Starting aw-work-sync");
+    }
+    debug!("Verbose logging enabled: {}", config.verbose);
+
     let host = hostname();
-    println!("Hostname:  {}", host);
+    info!("Hostname:  {}", host);
 
     let aw_config = aw_server::config::create_config(false, None);
     let server_api_key = aw_config.auth.api_key;
     if server_api_key.is_some() {
-        println!("Loaded API key from aw-server-rust config");
+        info!("Loaded API key from aw-server-rust config");
     }
-    let aw_client =
-        AwClient::new_with_api_key("localhost", 5600, "aw-work-sync", server_api_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create ActivityWatch client: {}", e))?;
+    let port = if config.testing { 5699 } else { 5600 };
+    let aw_client = AwClient::new_with_api_key("localhost", port, "aw-work-sync", server_api_key)
+        .map_err(|e| anyhow::anyhow!("Failed to create ActivityWatch client: {}", e))?;
 
-    println!("Running every {}s (Ctrl-C to stop).", config.interval.as_secs());
+    info!(
+        "Running every {}s (Ctrl-C to stop).",
+        config.interval.as_secs()
+    );
     loop {
         if let Err(e) = sync_once(&aw_client, &config.sheet_key, &config.regex, &host).await {
-            eprintln!("Sync error: {:#}", e);
+            error!("Sync error: {:#}", e);
         }
         tokio::time::sleep(config.interval).await;
     }
-
-    // Ok(())
 }

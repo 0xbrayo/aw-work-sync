@@ -34,10 +34,13 @@ pub fn cache_key(start: &DateTime<Utc>, end: &DateTime<Utc>) -> String {
 impl QueryCache {
     pub fn load(path: PathBuf) -> Result<Self> {
         let store = if path.exists() {
-            match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
                 Some(s) => s,
                 None => {
-                    eprintln!("Warning: cache file corrupt or unreadable, starting fresh.");
+                    log::warn!("Warning: cache file corrupt or unreadable, starting fresh.");
                     CacheStore::default()
                 }
             }
@@ -59,7 +62,14 @@ impl QueryCache {
     }
 
     pub fn insert(&mut self, key: String, result: serde_json::Value, ttl_secs: i64) {
-        self.store.entries.insert(key, CacheEntry { result, cached_at: Utc::now(), ttl_secs });
+        self.store.entries.insert(
+            key,
+            CacheEntry {
+                result,
+                cached_at: Utc::now(),
+                ttl_secs,
+            },
+        );
     }
 
     pub fn save(&self) -> Result<()> {

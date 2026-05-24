@@ -1,12 +1,15 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use aw_models::Event;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
-    pub result: serde_json::Value,
+    pub duration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
     pub cached_at: DateTime<Utc>,
     pub ttl_secs: i64,
 }
@@ -19,7 +22,26 @@ impl CacheEntry {
 
 #[derive(Serialize, Deserialize, Default)]
 struct CacheStore {
+    #[serde(serialize_with = "serialize_entries_descending")]
     entries: HashMap<String, CacheEntry>,
+}
+
+fn serialize_entries_descending<S>(
+    entries: &HashMap<String, CacheEntry>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut sorted: Vec<_> = entries.iter().collect();
+    sorted.sort_by(|a, b| b.0.cmp(a.0)); // Sort descending by key (newer first)
+
+    let mut map = serializer.serialize_map(Some(sorted.len()))?;
+    for (k, v) in sorted {
+        map.serialize_entry(k, v)?;
+    }
+    map.end()
 }
 
 pub struct QueryCache {
@@ -33,7 +55,7 @@ pub fn cache_key(start: &DateTime<Utc>, end: &DateTime<Utc>) -> String {
 
 impl QueryCache {
     pub fn load(path: PathBuf) -> Result<Self> {
-        let store = if path.exists() {
+        let mut store = if path.exists() {
             match std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -48,8 +70,32 @@ impl QueryCache {
             CacheStore::default()
         };
 
+        let mut migrated = false;
+        for entry in store.entries.values_mut() {
+            if entry.duration.is_none() {
+                if let Some(res) = &entry.result {
+                    let events: Vec<Event> =
+                        serde_json::from_value(res["events"].clone()).unwrap_or_default();
+                    let secs =
+                        crate::working_hours::generous_approx(&events, Duration::seconds(10 * 60))
+                            .num_seconds() as f64;
+                    entry.duration = Some(secs);
+                    migrated = true;
+                }
+            }
+            if entry.result.is_some() {
+                entry.result = None;
+                migrated = true;
+            }
+        }
+
         let mut cache = Self { path, store };
         cache.evict_expired(Utc::now());
+        if migrated {
+            if let Err(e) = cache.save() {
+                log::warn!("Failed to save migrated cache: {}", e);
+            }
+        }
         Ok(cache)
     }
 
@@ -61,11 +107,12 @@ impl QueryCache {
         self.store.entries.get(key)
     }
 
-    pub fn insert(&mut self, key: String, result: serde_json::Value, ttl_secs: i64) {
+    pub fn insert(&mut self, key: String, duration: f64, ttl_secs: i64) {
         self.store.entries.insert(
             key,
             CacheEntry {
-                result,
+                duration: Some(duration),
+                result: None,
                 cached_at: Utc::now(),
                 ttl_secs,
             },
@@ -77,5 +124,23 @@ impl QueryCache {
         std::fs::write(&tmp, serde_json::to_string_pretty(&self.store)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn test_migrate_and_sort_cache() {
+        if let Some(config_dir) = crate::logging::get_config_dir() {
+            let host = crate::hostname();
+            let path = config_dir.join(format!("query_cache_{}.json", host));
+            if path.exists() {
+                let cache = QueryCache::load(path).unwrap();
+                cache.save().unwrap();
+                println!("Saved cache sorted!");
+            }
+        }
     }
 }

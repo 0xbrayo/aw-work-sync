@@ -331,8 +331,10 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         None => DAYS_BACK_ON_NEW as usize,
     };
 
+    let query_days_back = days_back.max(DAYS_BACK_ON_NEW as usize);
+
     // Day-granular timeperiods (one per day from oldest to today).
-    let timeperiods: Vec<(DateTime<Local>, DateTime<Local>)> = (0..days_back)
+    let timeperiods: Vec<(DateTime<Local>, DateTime<Local>)> = (0..query_days_back)
         .rev()
         .map(|i| {
             let i = i as i64;
@@ -405,7 +407,14 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
     let mut fresh_map: HashMap<String, serde_json::Value> = HashMap::new();
     for (i, result) in fresh_results.into_iter().enumerate() {
         match &batch_cache[i] {
-            Some((key, ttl)) => cache.insert(key.clone(), result, *ttl),
+            Some((key, ttl)) => {
+                let events: Vec<Event> =
+                    Deserialize::deserialize(&result["events"]).unwrap_or_default();
+                let secs =
+                    working_hours::generous_approx(&events, Duration::seconds(BREAK_TIME_SECS))
+                        .num_seconds() as f64;
+                cache.insert(key.clone(), secs, *ttl);
+            }
             None => {
                 let (s, e) = batch_query[i];
                 fresh_map.insert(cache_key(&s, &e), result);
@@ -427,38 +436,36 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         let is_today = date == today.date_naive();
 
         let hours = if is_today {
-            // Merge events from all cached hour blocks + live window result.
-            let mut all_events: Vec<Event> = Vec::new();
+            let mut total_secs = 0.0;
             for (bs, be) in &today_blocks {
                 let key = cache_key(&bs.with_timezone(&Utc), &be.with_timezone(&Utc));
                 if let Some(entry) = cache.get(&key) {
-                    let evs: Vec<Event> =
-                        Deserialize::deserialize(&entry.result["events"]).unwrap_or_default();
-                    all_events.extend(evs);
+                    total_secs += entry.duration.unwrap_or(0.0);
                 }
             }
             let live_evs: Vec<Event> =
                 Deserialize::deserialize(&live_result["events"]).unwrap_or_default();
-            all_events.extend(live_evs);
-            working_hours::generous_approx(&all_events, Duration::seconds(BREAK_TIME_SECS))
-                .num_seconds() as f64
-                / 3600.0
+            let live_secs =
+                working_hours::generous_approx(&live_evs, Duration::seconds(BREAK_TIME_SECS))
+                    .num_seconds() as f64;
+            total_secs += live_secs;
+            total_secs / 3600.0
         } else {
             let (s, e) = (tp.0.with_timezone(&Utc), tp.1.with_timezone(&Utc));
             let key = cache_key(&s, &e);
             // Grace-period days are in fresh_map (not yet cached); settled days are in cache.
-            let events: Vec<Event> = if let Some(result) = cache
-                .get(&key)
-                .map(|e| &e.result)
-                .or_else(|| fresh_map.get(&key))
-            {
-                Deserialize::deserialize(&result["events"]).unwrap_or_default()
+            if let Some(entry) = cache.get(&key) {
+                entry.duration.unwrap_or(0.0) / 3600.0
+            } else if let Some(result) = fresh_map.get(&key) {
+                let events: Vec<Event> =
+                    Deserialize::deserialize(&result["events"]).unwrap_or_default();
+                let secs =
+                    working_hours::generous_approx(&events, Duration::seconds(BREAK_TIME_SECS))
+                        .num_seconds() as f64;
+                secs / 3600.0
             } else {
-                Vec::new()
-            };
-            working_hours::generous_approx(&events, Duration::seconds(BREAK_TIME_SECS))
-                .num_seconds() as f64
-                / 3600.0
+                0.0
+            }
         };
 
         match last_date {

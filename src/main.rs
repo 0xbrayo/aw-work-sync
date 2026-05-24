@@ -413,7 +413,14 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
                 let secs =
                     working_hours::generous_approx(&events, Duration::seconds(BREAK_TIME_SECS))
                         .num_seconds() as f64;
-                cache.insert(key.clone(), secs, *ttl);
+                let bounds = working_hours::event_boundaries(&events);
+                cache.insert(
+                    key.clone(),
+                    secs,
+                    bounds.map(|(f, _)| f),
+                    bounds.map(|(_, l)| l),
+                    *ttl,
+                );
             }
             None => {
                 let (s, e) = batch_query[i];
@@ -436,19 +443,51 @@ async fn sync_once(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &st
         let is_today = date == today.date_naive();
 
         let hours = if is_today {
-            let mut total_secs = 0.0;
+            // Stitch today's cached hourly blocks + live window, filling
+            // cross-boundary gaps < BREAK_TIME_SECS that independent
+            // per-block generous_approx calls would miss.
+            let max_break = Duration::seconds(BREAK_TIME_SECS);
+
+            // Collect (duration_secs, first_event_ts, last_event_end_ts) per segment.
+            #[allow(clippy::type_complexity)]
+            let mut segments: Vec<(f64, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = Vec::new();
             for (bs, be) in &today_blocks {
                 let key = cache_key(&bs.with_timezone(&Utc), &be.with_timezone(&Utc));
                 if let Some(entry) = cache.get(&key) {
-                    total_secs += entry.duration.unwrap_or(0.0);
+                    let secs = entry.duration.unwrap_or(0.0);
+                    if secs > 0.0 {
+                        segments.push((secs, entry.first_event_ts, entry.last_event_end_ts));
+                    }
                 }
             }
+            // Live window segment.
             let live_evs: Vec<Event> =
                 Deserialize::deserialize(&live_result["events"]).unwrap_or_default();
             let live_secs =
-                working_hours::generous_approx(&live_evs, Duration::seconds(BREAK_TIME_SECS))
-                    .num_seconds() as f64;
-            total_secs += live_secs;
+                working_hours::generous_approx(&live_evs, max_break).num_seconds() as f64;
+            if live_secs > 0.0 {
+                let bounds = working_hours::event_boundaries(&live_evs);
+                segments.push((live_secs, bounds.map(|(f, _)| f), bounds.map(|(_, l)| l)));
+            }
+
+            // Sum durations, adding inter-segment gaps that generous_approx would merge.
+            let mut total_secs = 0.0f64;
+            let mut prev_end: Option<DateTime<Utc>> = None;
+            for (secs, first_ts, last_end) in &segments {
+                if let (Some(pe), Some(ft)) = (prev_end, first_ts) {
+                    let gap = *ft - pe;
+                    if gap > Duration::zero() && gap < max_break {
+                        total_secs += gap.num_seconds() as f64;
+                    }
+                }
+                total_secs += secs;
+                // Update prev_end to the latest end we've seen so far.
+                prev_end = match (prev_end, *last_end) {
+                    (Some(pe), Some(le)) => Some(pe.max(le)),
+                    (None, le) => le,
+                    (pe, None) => pe,
+                };
+            }
             total_secs / 3600.0
         } else {
             let (s, e) = (tp.0.with_timezone(&Utc), tp.1.with_timezone(&Utc));

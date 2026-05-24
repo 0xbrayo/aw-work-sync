@@ -1,5 +1,4 @@
 use anyhow::Result;
-use aw_models::Event;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,6 +9,12 @@ pub struct CacheEntry {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// Timestamp of the first event in this block (for cross-boundary gap stitching).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_event_ts: Option<DateTime<Utc>>,
+    /// End timestamp of the last event (timestamp + duration) in this block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_end_ts: Option<DateTime<Utc>>,
     pub cached_at: DateTime<Utc>,
     pub ttl_secs: i64,
 }
@@ -74,7 +79,7 @@ impl QueryCache {
         for entry in store.entries.values_mut() {
             if entry.duration.is_none() {
                 if let Some(res) = &entry.result {
-                    let events: Vec<Event> =
+                    let events: Vec<aw_models::Event> =
                         serde_json::from_value(res["events"].clone()).unwrap_or_default();
                     let secs =
                         crate::working_hours::generous_approx(&events, Duration::seconds(10 * 60))
@@ -107,12 +112,21 @@ impl QueryCache {
         self.store.entries.get(key)
     }
 
-    pub fn insert(&mut self, key: String, duration: f64, ttl_secs: i64) {
+    pub fn insert(
+        &mut self,
+        key: String,
+        duration: f64,
+        first_event_ts: Option<DateTime<Utc>>,
+        last_event_end_ts: Option<DateTime<Utc>>,
+        ttl_secs: i64,
+    ) {
         self.store.entries.insert(
             key,
             CacheEntry {
                 duration: Some(duration),
                 result: None,
+                first_event_ts,
+                last_event_end_ts,
                 cached_at: Utc::now(),
                 ttl_secs,
             },

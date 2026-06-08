@@ -9,20 +9,23 @@ pub fn generous_approx(events: &[Event], max_break: Duration) -> Duration {
         return Duration::zero();
     }
 
-    let mut sorted = events.to_vec();
-    sorted.sort_by_key(|e| e.timestamp);
+    // Only timestamp + duration are needed; collect those (both Copy) instead of
+    // cloning whole Events, whose `data` JSON map is the bulk of their size.
+    let mut spans: Vec<(DateTime<Utc>, Duration)> =
+        events.iter().map(|e| (e.timestamp, e.duration)).collect();
+    spans.sort_by_key(|(ts, _)| *ts);
 
     // Compute the total duration using fold, skipping the first element since it's our base case.
-    let (total, _) = sorted.iter().skip(1).fold(
-        (sorted[0].duration, sorted[0].timestamp + sorted[0].duration),
-        |(total, prev_end), e| {
-            let gap = e.timestamp - prev_end;
+    let (total, _) = spans.iter().skip(1).fold(
+        (spans[0].1, spans[0].0 + spans[0].1),
+        |(total, prev_end), &(ts, dur)| {
+            let gap = ts - prev_end;
             let gap_fill = if gap > Duration::zero() && gap < max_break {
                 gap
             } else {
                 Duration::zero()
             };
-            (total + gap_fill + e.duration, e.timestamp + e.duration)
+            (total + gap_fill + dur, ts + dur)
         },
     );
 

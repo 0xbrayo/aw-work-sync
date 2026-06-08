@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::provider::{SheetProvider, SheetWrite};
+
 const SHEETS_API: &str = "https://sheets.googleapis.com/v4/spreadsheets";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ServiceAccount {
     client_email: String,
     private_key: String,
@@ -34,7 +37,8 @@ struct ValuesResponse {
 
 pub struct SheetsClient {
     client: Client,
-    access_token: String,
+    sa: ServiceAccount,
+    token_info: tokio::sync::Mutex<(String, std::time::Instant)>,
 }
 
 impl SheetsClient {
@@ -59,6 +63,18 @@ impl SheetsClient {
         let sa: ServiceAccount =
             serde_json::from_str(&sa_json).context("Failed to parse service account JSON")?;
 
+        let client = Client::new();
+        let access_token = Self::fetch_token(&client, &sa).await?;
+        let token_info = tokio::sync::Mutex::new((access_token, std::time::Instant::now()));
+
+        Ok(Self {
+            client,
+            sa,
+            token_info,
+        })
+    }
+
+    async fn fetch_token(client: &Client, sa: &ServiceAccount) -> Result<String> {
         let now = Utc::now().timestamp();
         let claims = JwtClaims {
             iss: sa.client_email.clone(),
@@ -72,7 +88,6 @@ impl SheetsClient {
             .context("Failed to parse service account private key (expected RSA PEM)")?;
         let jwt = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
 
-        let client = Client::new();
         let resp = client
             .post(&sa.token_uri)
             .form(&[
@@ -98,10 +113,20 @@ impl SheetsClient {
             .await
             .context("Failed to parse Google token response")?;
 
-        Ok(Self {
-            client,
-            access_token: token.access_token,
-        })
+        Ok(token.access_token)
+    }
+
+    pub async fn get_token(&self) -> Result<String> {
+        let mut guard = self.token_info.lock().await;
+        let (ref token, instant) = *guard;
+        if instant.elapsed().as_secs() > 3000 {
+            log::info!("Google access token expired or near expiry, refreshing...");
+            let new_token = Self::fetch_token(&self.client, &self.sa).await?;
+            *guard = (new_token.clone(), std::time::Instant::now());
+            Ok(new_token)
+        } else {
+            Ok(token.clone())
+        }
     }
 
     fn range_url(&self, sheet_key: &str, worksheet: &str, range: &str) -> String {
@@ -120,10 +145,11 @@ impl SheetsClient {
         worksheet: &str,
     ) -> Result<Vec<Vec<String>>> {
         let url = self.range_url(sheet_key, worksheet, "A:Z");
+        let token = self.get_token().await?;
         let resp = self
             .client
             .get(&url)
-            .bearer_auth(&self.access_token)
+            .bearer_auth(&token)
             .send()
             .await
             .context("Failed to send request to Google Sheets")?;
@@ -145,65 +171,63 @@ impl SheetsClient {
             .context("Failed to parse Google Sheets response")?;
         Ok(data.values.unwrap_or_default())
     }
+}
 
-    /// Update column B of the given 1-indexed row with a new hours value.
-    pub async fn update_cell(
-        &self,
-        sheet_key: &str,
-        worksheet: &str,
-        row: usize,
-        hours: f64,
-    ) -> Result<()> {
-        let url = format!(
-            "{}?valueInputOption=USER_ENTERED",
-            self.range_url(sheet_key, worksheet, &format!("B{}", row))
-        );
-        let resp = self
-            .client
-            .put(&url)
-            .bearer_auth(&self.access_token)
-            .json(&serde_json::json!({"values": [[hours]]}))
-            .send()
-            .await
-            .context("Failed to update cell")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to update cell ({status}): {text}");
-        }
-        Ok(())
+#[async_trait]
+impl SheetProvider for SheetsClient {
+    async fn get_all_values(&self, sheet_key: &str, worksheet: &str) -> Result<Vec<Vec<String>>> {
+        self.get_all_values(sheet_key, worksheet).await
     }
 
-    /// Append [date, hours] as a new row after the last data row.
-    pub async fn append_row(
+    async fn write_changes(
         &self,
         sheet_key: &str,
         worksheet: &str,
-        date: &str,
-        hours: f64,
+        changes: Vec<SheetWrite>,
     ) -> Result<()> {
-        let full_range = format!("'{}'!A:B", worksheet);
-        let url = format!(
-            "{}/{}/values/{}:append?valueInputOption=USER_ENTERED",
-            SHEETS_API,
-            sheet_key,
-            urlencoding::encode(&full_range)
-        );
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        let mut data = Vec::new();
+        for change in changes {
+            let (range, values) = match &change.date {
+                Some(date) => {
+                    let r = format!("'{}'!A{}:B{}", worksheet, change.row, change.row);
+                    (r, serde_json::json!([[date, change.hours]]))
+                }
+                None => {
+                    let r = format!("'{}'!B{}", worksheet, change.row);
+                    (r, serde_json::json!([[change.hours]]))
+                }
+            };
+            data.push(serde_json::json!({
+                "range": range,
+                "values": values
+            }));
+        }
+
+        let url = format!("{}/{}/values:batchUpdate", SHEETS_API, sheet_key);
+
+        let token = self.get_token().await?;
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(&self.access_token)
-            .json(&serde_json::json!({"values": [[date, hours]]}))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "valueInputOption": "USER_ENTERED",
+                "data": data
+            }))
             .send()
             .await
-            .context("Failed to append row")?;
+            .context("Failed to send batch update to Google Sheets")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to append row ({status}): {text}");
+            anyhow::bail!("Failed to batch update Google Sheets ({status}): {text}");
         }
+
         Ok(())
     }
 }

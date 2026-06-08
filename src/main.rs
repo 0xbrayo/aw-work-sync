@@ -1,6 +1,9 @@
 mod cache;
+mod excel_local;
+mod excel_online;
+mod google_sheets;
 mod logging;
-mod sheets;
+mod provider;
 mod working_hours;
 
 use anyhow::{Context, Result};
@@ -13,6 +16,7 @@ use aw_models::Event;
 use cache::{cache_key, QueryCache};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use log::{debug, error, info, warn};
+use provider::{SheetProvider, SheetWrite};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,6 +31,26 @@ const CACHE_TTL_PAST_DAYS_SECS: i64 = 3 * 24 * 3600;
 // aw-client flushes events every 10s (commit_interval); 30s gives 3× margin for late-landing events.
 const CACHE_GRACE_SECS: i64 = 30;
 const CONFIG_GUIDANCE: &str = "Please configure your sheets by editing the 'sheets' list in the config file.\nEach entry requires 'sheet_key' and 'regex' fields. Example:\n  sheets:\n    - sheet_key: \"your-sheet-key\"\n      regex: \"your-regex\"\nNote: if top-level 'sheet_key'/'regex' fields are also present, 'sheets[0]' takes precedence and they will be overwritten.";
+
+enum ProviderType {
+    Google,
+    ExcelLocal,
+    ExcelOnline,
+}
+
+fn infer_provider(sheet_key: &str) -> ProviderType {
+    let has_xls_ext = |ext: &str| {
+        sheet_key.len() > ext.len()
+            && sheet_key[sheet_key.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    };
+    if has_xls_ext(".xlsx") || has_xls_ext(".xls") {
+        ProviderType::ExcelLocal
+    } else if sheet_key.contains('/') {
+        ProviderType::ExcelOnline
+    } else {
+        ProviderType::Google
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct SheetConfig {
@@ -371,7 +395,14 @@ fn build_query(hostname: &str, regex: &str) -> String {
         "{canonical};\nduration = sum_durations(events);\nRETURN = {{\"events\": events, \"duration\": duration}};"
     )
 }
-async fn sync_sheet(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &str) -> Result<()> {
+
+async fn sync_sheet(
+    aw_client: &AwClient,
+    provider: &dyn SheetProvider,
+    sheet_key: &str,
+    regex: &str,
+    host: &str,
+) -> Result<()> {
     let cache_file = cache_path(host, sheet_key);
     let mut cache = QueryCache::load(cache_file)?;
 
@@ -385,10 +416,9 @@ async fn sync_sheet(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &s
         .single()
         .expect("ambiguous local time for today's day-start");
 
-    let sheets = sheets::SheetsClient::from_service_account().await?;
     let worksheet = format!("worked-{}", host);
 
-    let raw_values = sheets
+    let raw_values = provider
         .get_all_values(sheet_key, &worksheet)
         .await
         .with_context(|| {
@@ -522,6 +552,8 @@ async fn sync_sheet(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &s
     cache.save()?;
 
     let initial_row_count = values.len();
+    let mut changes = Vec::new();
+    let mut current_row_count = initial_row_count;
 
     for tp in &timeperiods {
         if tp.0 > now {
@@ -601,21 +633,29 @@ async fn sync_sheet(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &s
         match last_date {
             Some(ld) if date == ld => {
                 info!("Updating  [{}, {:.4}h]", date_str, hours);
-                sheets
-                    .update_cell(sheet_key, &worksheet, initial_row_count, hours)
-                    .await?;
+                changes.push(SheetWrite {
+                    row: initial_row_count,
+                    date: None,
+                    hours,
+                });
             }
             Some(ld) if date > ld => {
                 info!("Appending [{}, {:.4}h]", date_str, hours);
-                sheets
-                    .append_row(sheet_key, &worksheet, &date_str, hours)
-                    .await?;
+                current_row_count += 1;
+                changes.push(SheetWrite {
+                    row: current_row_count,
+                    date: Some(date_str),
+                    hours,
+                });
             }
             None => {
                 info!("Appending [{}, {:.4}h]", date_str, hours);
-                sheets
-                    .append_row(sheet_key, &worksheet, &date_str, hours)
-                    .await?;
+                current_row_count += 1;
+                changes.push(SheetWrite {
+                    row: current_row_count,
+                    date: Some(date_str),
+                    hours,
+                });
             }
             _ => {
                 debug!("Skipping  [{}, {:.4}h]", date_str, hours);
@@ -623,11 +663,62 @@ async fn sync_sheet(aw_client: &AwClient, sheet_key: &str, regex: &str, host: &s
         }
     }
 
-    info!("Done.");
+    if !changes.is_empty() {
+        provider
+            .write_changes(sheet_key, &worksheet, changes)
+            .await?;
+    }
+
     Ok(())
 }
 
-async fn sync_once(aw_client: &AwClient, config: &Config, host: &str) -> Result<()> {
+struct ProviderCache {
+    google: tokio::sync::Mutex<Option<std::sync::Arc<google_sheets::SheetsClient>>>,
+    excel_online: tokio::sync::Mutex<Option<std::sync::Arc<excel_online::ExcelOnlineProvider>>>,
+    excel_local: excel_local::ExcelLocalProvider,
+}
+
+impl ProviderCache {
+    fn new() -> Self {
+        Self {
+            google: tokio::sync::Mutex::new(None),
+            excel_online: tokio::sync::Mutex::new(None),
+            excel_local: excel_local::ExcelLocalProvider,
+        }
+    }
+
+    async fn get_google(&self) -> Result<std::sync::Arc<google_sheets::SheetsClient>> {
+        let mut guard = self.google.lock().await;
+        if let Some(ref client) = *guard {
+            Ok(client.clone())
+        } else {
+            let client =
+                std::sync::Arc::new(google_sheets::SheetsClient::from_service_account().await?);
+            *guard = Some(client.clone());
+            Ok(client)
+        }
+    }
+
+    async fn get_excel_online(&self) -> Result<std::sync::Arc<excel_online::ExcelOnlineProvider>> {
+        let mut guard = self.excel_online.lock().await;
+        if let Some(ref client) = *guard {
+            Ok(client.clone())
+        } else {
+            let client = std::sync::Arc::new(
+                excel_online::ExcelOnlineProvider::from_client_credentials().await?,
+            );
+            *guard = Some(client.clone());
+            Ok(client)
+        }
+    }
+}
+
+async fn sync_once(
+    aw_client: &AwClient,
+    config: &Config,
+    host: &str,
+    provider_cache: &ProviderCache,
+) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
     for (idx, sheet) in config.sheets.iter().enumerate() {
         info!(
@@ -637,7 +728,39 @@ async fn sync_once(aw_client: &AwClient, config: &Config, host: &str) -> Result<
             sheet.sheet_key,
             sheet.regex
         );
-        if let Err(e) = sync_sheet(aw_client, &sheet.sheet_key, &sheet.regex, host).await {
+        let result = match infer_provider(&sheet.sheet_key) {
+            ProviderType::Google => match provider_cache.get_google().await {
+                Ok(provider) => {
+                    sync_sheet(
+                        aw_client,
+                        provider.as_ref(),
+                        &sheet.sheet_key,
+                        &sheet.regex,
+                        host,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
+            ProviderType::ExcelLocal => {
+                let provider = &provider_cache.excel_local;
+                sync_sheet(aw_client, provider, &sheet.sheet_key, &sheet.regex, host).await
+            }
+            ProviderType::ExcelOnline => match provider_cache.get_excel_online().await {
+                Ok(provider) => {
+                    sync_sheet(
+                        aw_client,
+                        provider.as_ref(),
+                        &sheet.sheet_key,
+                        &sheet.regex,
+                        host,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = result {
             error!("Error syncing sheet '{}': {:#}", sheet.sheet_key, e);
             errors.push(format!("Sheet '{}': {:#}", sheet.sheet_key, e));
         }
@@ -676,12 +799,13 @@ async fn main() -> Result<()> {
     let aw_client = AwClient::new_with_api_key("localhost", port, "aw-work-sync", server_api_key)
         .map_err(|e| anyhow::anyhow!("Failed to create ActivityWatch client: {}", e))?;
 
+    let provider_cache = ProviderCache::new();
     info!(
         "Running every {}s (Ctrl-C to stop).",
         config.interval.as_secs()
     );
     loop {
-        if let Err(e) = sync_once(&aw_client, &config, &host).await {
+        if let Err(e) = sync_once(&aw_client, &config, &host, &provider_cache).await {
             error!("Sync error: {:#}", e);
         }
         tokio::time::sleep(config.interval).await;
@@ -734,6 +858,36 @@ sheets:
         // Check legacy fields are populated from first sheet for backward compatibility
         assert_eq!(cfg.sheet_key, Some("key-1".to_string()));
         assert_eq!(cfg.regex, Some("regex-1".to_string()));
+    }
+
+    #[test]
+    fn test_config_infers_mixed_providers() {
+        // Mirrors the multi-backend config documented in the README.
+        let yaml = r#"
+sheets:
+  - sheet_key: your-google-spreadsheet-id
+    regex: "work"
+  - sheet_key: ~/work-hours.xlsx
+    regex: "work"
+  - sheet_key: b!driveId/01ABCITEMID
+    regex: "work"
+"#;
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.sheets.len(), 3);
+
+        assert!(matches!(
+            infer_provider(&cfg.sheets[0].sheet_key),
+            ProviderType::Google
+        ));
+        assert!(matches!(
+            infer_provider(&cfg.sheets[1].sheet_key),
+            ProviderType::ExcelLocal
+        ));
+        assert!(matches!(
+            infer_provider(&cfg.sheets[2].sheet_key),
+            ProviderType::ExcelOnline
+        ));
     }
 
     #[test]
